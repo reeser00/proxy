@@ -19,16 +19,16 @@ pub struct Proxy {
     pub client_receiver: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     pub client_stream: Arc<Mutex<Option<TcpStream>>>,
     pub server_stream: Arc<Mutex<Option<TcpStream>>>,
+    pub packet_transmitter: Arc<Mutex<mpsc::Sender<Vec<u8>>>>,
 }
 
 impl Proxy {
-    pub async fn from(home_addr: String, server_addr: String) -> Result<Self, Error> {
+    pub async fn from(home_addr: String, server_addr: String, packet_transmitter: Arc<Mutex<mpsc::Sender<Vec<u8>>>>) -> Result<Self, Error> {
         let listener = TcpListener::bind(&home_addr).await;
         let (c_tx, c_rx) = mpsc::channel(100);
         let (s_tx, s_rx) = mpsc::channel(100);
         match listener {
             Ok(tcp_listener) => {
-                println!("Proxy server running on {}", home_addr);
 
                 let proxy = Self {
                     home_addr,
@@ -40,6 +40,7 @@ impl Proxy {
                     client_receiver: Arc::new(Mutex::new(s_rx)),
                     client_stream: Arc::new(Mutex::new(None)),
                     server_stream: Arc::new(Mutex::new(None)),
+                    packet_transmitter
                 };
                 Ok(proxy)
             },
@@ -76,6 +77,7 @@ impl Proxy {
                     Some(_) => {
                         let client_stream = self.client_stream.clone();
                         let client_sender = self.client_sender.clone();
+                        let packet_transmitter = self.packet_transmitter.clone();
                         tokio::spawn( async move {
                             loop{
                                 let mut guard = match client_stream.lock() {
@@ -100,21 +102,31 @@ impl Proxy {
                                 match c_stream.try_read(&mut buffer) {
                                     Ok(0) => {
                                         //Connection closed by client
-                                        println!("Client disconnected");
                                         *guard = None;
                                         return;
                                     },
                                     Ok(bytes_read) => {
-                                        println!("Received {} bytes: {:?}", bytes_read, &buffer[..bytes_read]);
                                         match client_sender.lock() {
                                             Ok(sender) => {
                                                 match sender.try_send(buffer[..bytes_read].to_vec()) {
-                                                    Ok(_) => { println!("Send a package to server") },
+                                                    Ok(_) => {},
                                                     Err(_) => {eprintln!("error converting array to vector");}
                                                 }
                                             }
                                             Err(_) => {
                                                 eprintln!("Failed to acquire lock on client sender");
+                                                continue;
+                                            }
+                                        }
+                                        match packet_transmitter.lock() {
+                                            Ok(sender) => {
+                                                match sender.try_send(buffer[..bytes_read].to_vec()) {
+                                                    Ok(_) => {},
+                                                    Err(_) => {eprintln!("error converting array to vector");}
+                                                }
+                                            }
+                                            Err(_) => {
+                                                eprintln!("Failed to acquire lock on packet_transmitter");
                                                 continue;
                                             }
                                         }
@@ -146,6 +158,7 @@ impl Proxy {
                     Some(_) => {
                         let server_stream = self.server_stream.clone();
                         let server_sender = self.server_sender.clone();
+                        let packet_transmitter = self.packet_transmitter.clone();
                         tokio::spawn( async move {
                             loop{
                                 let mut guard = match server_stream.lock() {
@@ -168,21 +181,31 @@ impl Proxy {
                                 match s_stream.try_read(&mut buffer) {
                                     Ok(0) => {
                                         //Connection closed by client
-                                        println!("Destination Server closed the connection");
                                         *guard = None;
                                         return;
                                     },
                                     Ok(bytes_read) => {
-                                        println!("Received {} bytes: {:?}", bytes_read, &buffer[..bytes_read]);
                                         match server_sender.lock() {
                                             Ok(sender) => {
                                                 match sender.try_send(buffer[..bytes_read].to_vec()) {
-                                                    Ok(_) => { println!("Send a package to client") },
+                                                    Ok(_) => {},
                                                     Err(_) => {eprintln!("error converting array to vector");}
                                                 }
                                             }
                                             Err(_) => {
                                                 eprintln!("Failed to acquire lock on client sender");
+                                                continue;
+                                            }
+                                        }
+                                        match packet_transmitter.lock() {
+                                            Ok(sender) => {
+                                                match sender.try_send(buffer[..bytes_read].to_vec()) {
+                                                    Ok(_) => {},
+                                                    Err(_) => {eprintln!("error converting array to vector");}
+                                                }
+                                            }
+                                            Err(_) => {
+                                                eprintln!("Failed to acquire lock on packet_transmitter");
                                                 continue;
                                             }
                                         }
@@ -221,7 +244,6 @@ impl Proxy {
                 };
                 let _rx = match guard.try_recv() {
                     Ok(buffer) => {
-                        println!("[ClientRX]: I got: {:?}", buffer);
 
                         let mut guard = match client_stream.lock() {
                             Ok(guard) => {
@@ -235,7 +257,6 @@ impl Proxy {
 
                         let _stream = match guard.as_mut() {
                             Some(stream) => {
-                                println!("Mutex acquired... sending buffer to Client");
                                 stream.try_write(&buffer[..])
                             },
                             None => {
@@ -243,8 +264,6 @@ impl Proxy {
                                 return;
                             }
                         };
-
-                        println!("Result sending to Server {:?}", _stream);
 
                     },
                     Err(e) => {
@@ -275,7 +294,6 @@ impl Proxy {
 
                 let _rx = match guard.try_recv() {
                     Ok(buffer) => {
-                        println!("[ServerRX]: I got: {:?}", buffer);
 
                         let mut guard = match server_stream.lock() {
                             Ok(guard) => {
@@ -289,7 +307,6 @@ impl Proxy {
 
                         let _stream = match guard.as_mut() {
                             Some(stream) => {
-                                println!("Mutex acquired... sending buffer to Server");
                                 stream.try_write(&buffer[..])
                             },
                             None => {
@@ -298,7 +315,6 @@ impl Proxy {
                             }
                         };
 
-                        println!("Result sending to Server {:?}", _stream);
                     },
                     Err(e) => {
                         if e == mpsc::error::TryRecvError::Empty {
